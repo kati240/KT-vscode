@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{cspSource}} 'unsafe-inline'; script-src {{cspSource}} 'unsafe-inline' 'unsafe-eval'; img-src {{cspSource}} https: data:;">
+  <title>CodeMist</title>
+  <link rel="stylesheet" href="{{styleUri}}">
+</head>
+<body>
+  <!-- Top Navigation & Action -->
+  <div class="header-bar">
+    <div class="brand-title">
+      <span>CodeMist</span>
+      <span class="brand-badge">Visual Trace</span>
+    </div>
+    <div class="header-actions">
+      <button id="copy-markdown-btn" class="secondary-btn" title="Copy Complete Analysis Markdown for PR or Docs" style="display: none;">
+        <span>📋</span> <span id="copy-btn-text">Copy for PR</span>
+      </button>
+      <button id="trigger-analysis-btn" class="action-btn" title="Analyze Current Selection in Active Editor">
+        <span>⚡</span> Trace Selection
+      </button>
+    </div>
+  </div>
+
+  <!-- Breadcrumb Navigation Stack -->
+  <nav id="breadcrumb-bar" class="breadcrumb-container" style="display: none;" aria-label="Drill-down history">
+    <div id="breadcrumbs-list" class="breadcrumbs-list"></div>
+  </nav>
+
+  <!-- Empty / Standby State -->
+  <div id="empty-state" class="state-container">
+    <div class="state-icon">🔍</div>
+    <div class="state-title">No Code Analyzed</div>
+    <div class="state-desc">
+      Highlight any code block in your editor and press <span class="shortcut-kbd">Alt+U</span> or <span class="shortcut-kbd">Ctrl+Shift+U</span> (or click <strong>Trace Selection</strong> above).
+    </div>
+  </div>
+
+  <!-- Loading State -->
+  <div id="loading-state" class="state-container" style="display: none;">
+    <div class="spinner"></div>
+    <div class="state-title">Harvesting & Tracing...</div>
+    <div class="state-desc" id="loading-desc">
+      Resolving symbols, capturing exact call sites, and compiling visual flow & edge cases.
+    </div>
+  </div>
+
+  <!-- Error State -->
+  <div id="error-state" style="display: none;">
+    <div class="error-banner">
+      <strong>Tracing Error:</strong>
+      <div id="error-message" style="margin-top: 4px;"></div>
+    </div>
+  </div>
+
+  <!-- Analysis Content State -->
+  <div id="content-state" style="display: none;">
+    <!-- Active Function / Scope Title with Partial Selection Expand -->
+    <div class="scope-title-bar">
+      <div class="scope-info">
+        <span class="scope-label" id="scope-prefix">SCOPE:</span>
+        <span id="scope-fn-name" class="scope-name">Function</span>
+        <span id="scope-lines-info" class="scope-lines"></span>
+      </div>
+      <button id="expand-fn-btn" class="expand-btn" style="display: none;" title="Expand selection to entire enclosing function">
+        Expand to Full Function ⤢
+      </button>
+    </div>
+
+    <!-- Section 1: Executive Summary -->
+    <div class="section">
+      <div class="section-header">
+        <span>Executive Summary</span>
+      </div>
+      <div class="summary-card">
+        <ul id="summary-list" class="summary-list"></ul>
+      </div>
+    </div>
+
+    <!-- Section 2: Upstream ("Called From") with Interactive See All Drawer -->
+    <div class="section" id="upstream-section">
+      <div class="section-header">
+        <span>⬆️ Called From (Upstream)</span>
+        <span id="callers-count-badge" class="count-badge">0</span>
+      </div>
+      
+      <!-- Top 3-5 Pinned Callers -->
+      <div id="primary-callers-container" class="chips-container"></div>
+
+      <!-- Prominent "See All Callers" Toggle -->
+      <div id="see-all-callers-wrapper" class="see-all-wrapper" style="display: none;">
+        <button id="toggle-all-callers-btn" class="drawer-toggle-btn" aria-expanded="false">
+          <span class="toggle-text">See All Callers (Total: <span id="all-callers-btn-count">0</span>)</span>
+          <span class="toggle-icon">▾</span>
+        </button>
+
+        <!-- Searchable Full Callers Panel -->
+        <div id="all-callers-panel" class="searchable-drawer-panel" style="display: none;">
+          <!-- Live Filter Input -->
+          <div class="search-input-wrapper">
+            <span class="search-icon">🔍</span>
+            <input type="text" id="callers-filter-input" class="search-input" placeholder="Filter by function, file path, or call code..." />
+          </div>
+
+          <!-- Category Filter Pills -->
+          <div class="category-pills-bar">
+            <button class="category-pill active" data-cat="all">All (<span id="cat-count-all">0</span>)</button>
+            <button class="category-pill" data-cat="same_module">Same Module (<span id="cat-count-module">0</span>)</button>
+            <button class="category-pill" data-cat="other_prod">Other Prod (<span id="cat-count-other">0</span>)</button>
+            <button class="category-pill" data-cat="test">Tests (<span id="cat-count-test">0</span>)</button>
+          </div>
+
+          <!-- Un-truncated List of Callers -->
+          <div id="all-callers-list" class="full-callers-list"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Section 3: Interactive UML Diagram -->
+    <div class="section">
+      <div class="section-header">
+        <span>Visual Execution Flow</span>
+        <span id="diagram-type-badge" class="brand-badge">FLOWCHART</span>
+      </div>
+      <div id="diagram-viewport" class="diagram-container"></div>
+      <div class="diagram-hint">
+        💡 <em>Click any node to jump to code • Editor cursor highlights matching nodes in real-time.</em>
+      </div>
+    </div>
+
+    <!-- Section 4: Downstream ("Calls Into") with Partial Selection Drawer -->
+    <div class="section" id="downstream-section">
+      <div class="section-header">
+        <span>⬇️ Calls Into (Downstream)</span>
+        <span id="callees-count-badge" class="count-badge">0</span>
+      </div>
+
+      <!-- Functions called directly inside highlighted lines -->
+      <div id="selected-callees-container" class="chips-container"></div>
+
+      <!-- Prominent "See All Calls in Enclosing Function" Toggle -->
+      <div id="see-all-callees-wrapper" class="see-all-wrapper" style="display: none;">
+        <button id="toggle-parent-callees-btn" class="drawer-toggle-btn" aria-expanded="false">
+          <span class="toggle-text">See All Calls in Enclosing Function (<span id="all-callees-btn-count">0</span>)</span>
+          <span class="toggle-icon">▾</span>
+        </button>
+
+        <div id="all-callees-panel" class="searchable-drawer-panel" style="display: none;">
+          <div id="parent-callees-list" class="chips-container"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Section 5: What-If Edge Case Traces -->
+    <div class="section">
+      <div class="section-header">
+        <span>What-If Edge-Case Tracing</span>
+      </div>
+      <div id="traces-container" class="traces-list"></div>
+      <div class="diagram-hint">
+        ⚡ <em>Select an edge case to highlight offending lines & trace execution paths.</em>
+      </div>
+    </div>
+  </div>
+
+  <!-- Scripts -->
+  <script src="{{mermaidUri}}"></script>
+  <script src="{{scriptUri}}"></script>
+</body>
+</html>

@@ -1,0 +1,141 @@
+{
+  "name": "codemist",
+  "displayName": "CodeMist",
+  "description": "Visual Code Comprehension and What-If Edge-Case Tracing with interactive UML/Flowcharts",
+  "version": "0.0.1",
+  "publisher": "KT-vscode",
+  "license": "MIT",
+  "icon": "resources/icon.png",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kati240/KT-vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/kati240/KT-vscode/issues"
+  },
+  "homepage": "https://github.com/kati240/KT-vscode#readme",
+  "keywords": [
+    "uml",
+    "mermaid",
+    "flowchart",
+    "code-comprehension",
+    "code-visualization",
+    "call-hierarchy",
+    "edge-cases",
+    "ollama",
+    "tracing"
+  ],
+  "categories": [
+    "Visualization",
+    "Programming Languages",
+    "Education"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onCommand:codemist.explainSelection",
+    "onView:codemist.sidebarView"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "codemist.explainSelection",
+        "title": "CodeMist: Explain Selection & Trace Edge Cases",
+        "category": "CodeMist",
+        "icon": "$(graph)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "codemist.explainSelection",
+        "key": "ctrl+shift+u",
+        "mac": "cmd+shift+u",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "codemist.explainSelection",
+        "key": "alt+u",
+        "mac": "alt+u",
+        "when": "editorHasSelection"
+      },
+      {
+        "command": "codemist.explainSelection",
+        "key": "ctrl+alt+u",
+        "mac": "cmd+alt+u",
+        "when": "editorTextFocus"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "codemist.explainSelection",
+          "when": "editorHasSelection",
+          "group": "navigation@1"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "codemist.explainSelection",
+          "when": "editorHasSelection",
+          "group": "navigation"
+        }
+      ]
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codemist-sidebar",
+          "title": "CodeMist",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "codemist-sidebar": [
+        {
+          "type": "webview",
+          "id": "codemist.sidebarView",
+          "name": "Visual Trace",
+          "visibility": "visible"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CodeMist",
+      "properties": {
+        "codemist.apiEndpoint": {
+          "type": "string",
+          "default": "http://localhost:11434/v1/chat/completions",
+          "description": "OpenAI-compatible LLM endpoint (e.g. local Ollama, vLLM, LMStudio, or OpenAI/Gemini/Groq)."
+        },
+        "codemist.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API Key if using OpenAI, Gemini, or remote authenticated endpoints."
+        },
+        "codemist.modelName": {
+          "type": "string",
+          "default": "gemma4:latest",
+          "description": "Model identifier to query (e.g. gemma4:latest, gemma4:31b, llama3, qwen2.5-coder)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "package": "node esbuild.js --production"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "jsonrepair": "^3.15.0"
+  }
+}
