@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { jsonrepair } from 'jsonrepair';
 import { HarvestedContext, CallerInfo, CalleeInfo } from './contextHarvester';
 
 export interface AnalysisNode {
@@ -408,6 +409,12 @@ function resilientJsonParse(raw: string): any {
     } catch {}
   }
 
+  // Pass 2.5: Use jsonrepair library for malformed/truncated JSON
+  try {
+    const sub = firstBrace !== -1 ? text.substring(firstBrace) : text;
+    return JSON.parse(jsonrepair(sub));
+  } catch {}
+
   // Pass 3: Repair single quotes, unquoted keys, and trailing commas
   try {
     let repaired = text
@@ -448,6 +455,11 @@ function fallbackRegexExtraction(text: string): any {
   let summary: string[] = [];
   if (summaryMatches.length > 0) {
     summary = [...summaryMatches[0][1].matchAll(/["']([^"']+)["']/g)].map(m => m[1]);
+  } else {
+    const singleSummaryMatch = text.match(/"summary"\s*:\s*["']([^"']+)["']/);
+    if (singleSummaryMatch) {
+      summary = [singleSummaryMatch[1]];
+    }
   }
 
   const nodesMatches = [...text.matchAll(/\{\s*["']id["']\s*:\s*["']([^"']+)["'][\s\S]*?["']label["']\s*:\s*["']([^"']+)["']/g)];
@@ -460,11 +472,57 @@ function fallbackRegexExtraction(text: string): any {
   }));
 
   return {
-    summary: summary.length >= 3 ? summary.slice(0, 3) : undefined,
+    summary: summary.length > 0 ? summary.slice(0, 3) : undefined,
     nodes: nodes.length > 0 ? nodes : undefined,
     edges: [],
     whatIfTraces: []
   };
+}
+
+/**
+ * Safely normalizes the summary field whether the LLM returned an array, a single string, or an object.
+ */
+function normalizeSummary(rawSummary: any): [string, string, string] {
+  const defaults: [string, string, string] = [
+    'Executes operations within selected lines.',
+    'Processes variables and evaluates conditions.',
+    'Yields result or finishes block execution.'
+  ];
+
+  let items: string[] = [];
+
+  if (Array.isArray(rawSummary)) {
+    items = rawSummary
+      .map(s => (typeof s === 'string' ? s : (s?.text || s?.bullet || s?.point || s?.description || '')))
+      .map(s => String(s).replace(/^[-•*\d.)\s]+/, '').trim())
+      .filter(s => s.length > 1);
+  } else if (typeof rawSummary === 'string' && rawSummary.trim().length > 0) {
+    // Split string by newlines, bullet points, or sentence boundaries (never character-by-character!)
+    const byLines = rawSummary
+      .split(/\r?\n|(?:^|\s)[•*-]\s+|\d+\.\s+/)
+      .map(s => s.trim())
+      .filter(s => s.length > 1);
+
+    if (byLines.length >= 2) {
+      items = byLines;
+    } else {
+      const bySentences = rawSummary
+        .split(/(?<=[.!?])\s+/)
+        .map(s => s.trim())
+        .filter(s => s.length > 1);
+      items = bySentences.length > 0 ? bySentences : [rawSummary.trim()];
+    }
+  } else if (rawSummary && typeof rawSummary === 'object') {
+    items = Object.values(rawSummary)
+      .map(v => String(v).trim())
+      .filter(s => s.length > 1);
+  }
+
+  return [
+    items[0] || defaults[0],
+    items[1] || defaults[1],
+    items[2] || defaults[2]
+  ];
 }
 
 /**
@@ -473,11 +531,7 @@ function fallbackRegexExtraction(text: string): any {
 function parseLLMJsonResponse(raw: string, context: HarvestedContext): StructuredAnalysis {
   const parsed = resilientJsonParse(raw) || {};
 
-  const summary: [string, string, string] = [
-    parsed.summary?.[0] || 'Executes operations within selected lines.',
-    parsed.summary?.[1] || 'Processes variables and evaluates conditions.',
-    parsed.summary?.[2] || 'Yields result or finishes block execution.'
-  ];
+  const summary = normalizeSummary(parsed.summary);
 
   const validTypes = ['flowchart TD', 'stateDiagram-v2', 'sequenceDiagram'] as const;
   const diagramType = validTypes.includes(parsed.diagramType) ? parsed.diagramType : 'flowchart TD';

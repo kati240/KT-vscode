@@ -2,7 +2,7 @@
   "name": "codemist",
   "displayName": "CodeMist",
   "description": "Visual Code Comprehension and What-If Edge-Case Tracing with interactive UML/Flowcharts",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "KT-vscode",
   "license": "MIT",
   "icon": "resources/icon.png",
