@@ -102,13 +102,27 @@ function readCallSiteSnippet(currentDoc: vscode.TextDocument, filePath: string, 
 }
 
 /**
- * Recursively searches DocumentSymbols to find the innermost function/method containing position.
+ * Strips parameter signatures and class prefixes from LSP symbol names (e.g. "Operate(int, int)" -> "Operate").
+ */
+export function cleanSymbolName(rawName: string): string {
+  if (!rawName) return '';
+  return rawName
+    .replace(/\(.*$/, '')
+    .replace(/<.*$/, '')
+    .replace(/^.*(?:::|\.|->)/, '')
+    .trim();
+}
+
+/**
+ * Recursively searches DocumentSymbols to find the innermost function/method containing line range.
  */
 function findInnermostEnclosingSymbol(symbols: vscode.DocumentSymbol[], range: vscode.Range): vscode.DocumentSymbol | null {
   let bestMatch: vscode.DocumentSymbol | null = null;
 
   for (const sym of symbols) {
-    if (sym.range.contains(range.start) || sym.range.intersection(range)) {
+    const overlapsLine =
+      sym.range.start.line <= range.end.line && sym.range.end.line >= range.start.line;
+    if (overlapsLine || sym.range.contains(range.start) || sym.range.intersection(range)) {
       const isFunctionLike =
         sym.kind === vscode.SymbolKind.Function ||
         sym.kind === vscode.SymbolKind.Method ||
@@ -128,6 +142,120 @@ function findInnermostEnclosingSymbol(symbols: vscode.DocumentSymbol[], range: v
   }
 
   return bestMatch;
+}
+
+/**
+ * Recursively searches DocumentSymbols for a function/method matching the given name.
+ */
+export function findFunctionSymbolByName(symbols: vscode.DocumentSymbol[], targetName: string): vscode.DocumentSymbol | null {
+  const cleanedTarget = cleanSymbolName(targetName).toLowerCase();
+  if (!cleanedTarget) return null;
+
+  for (const sym of symbols) {
+    const isFunctionLike =
+      sym.kind === vscode.SymbolKind.Function ||
+      sym.kind === vscode.SymbolKind.Method ||
+      sym.kind === vscode.SymbolKind.Constructor;
+
+    if (isFunctionLike && cleanSymbolName(sym.name).toLowerCase() === cleanedTarget) {
+      return sym;
+    }
+
+    if (sym.children && sym.children.length > 0) {
+      const child = findFunctionSymbolByName(sym.children, targetName);
+      if (child) return child;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Resolves the actual definition file and 1-based line number of a called function.
+ */
+async function resolveCalleeDefinition(
+  document: vscode.TextDocument,
+  docIdentifier: string,
+  docSymbols: vscode.DocumentSymbol[],
+  fnName: string,
+  callPos: vscode.Position,
+  callLine: number
+): Promise<{ filePath: string; line: number }> {
+  // 1. Try LSP Definition Provider at the exact call site position
+  try {
+    const defs = await vscode.commands.executeCommand<(vscode.Location | vscode.LocationLink)[]>(
+      'vscode.executeDefinitionProvider',
+      document.uri,
+      callPos
+    );
+    if (defs && defs.length > 0) {
+      const first = defs[0] as any;
+      const targetUri: vscode.Uri | undefined = first.targetUri || first.uri;
+      const targetRange: vscode.Range | undefined = first.targetSelectionRange || first.targetRange || first.range;
+      if (targetUri && targetRange) {
+        const defPath = targetUri.scheme === 'untitled' ? targetUri.toString() : targetUri.fsPath;
+        const defLine = targetRange.start.line + 1;
+        if (defPath !== docIdentifier || defLine !== callLine) {
+          return { filePath: defPath, line: defLine };
+        }
+      }
+    }
+  } catch {}
+
+  // 2. Search DocumentSymbols in current file by function name
+  if (docSymbols.length > 0) {
+    const matchedSym = findFunctionSymbolByName(docSymbols, fnName);
+    if (matchedSym) {
+      return {
+        filePath: docIdentifier,
+        line: matchedSym.selectionRange.start.line + 1
+      };
+    }
+  }
+
+  // 3. Search current document text for function/method definition of fnName
+  try {
+    const escaped = fnName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const declPatterns = [
+      new RegExp(`^\\s*(?:(?:public|private|protected|internal|static|async|virtual|override|export|default|function|def|fn|func)\\s+)+[a-zA-Z0-9_<>\\[\\]?,\\s]*\\b${escaped}\\s*\\(`, 'm'),
+      new RegExp(`^\\s*(?:[a-zA-Z0-9_<>\\[\\]?]+\\s+)+${escaped}\\s*\\([^;]*\\)\\s*(?:\\{|=>|:)`, 'm'),
+      new RegExp(`^\\s*(?:const|let|var)\\s+${escaped}\\s*=\\s*(?:async\\s*)?(?:function\\b|\\([^)]*\\)\\s*=>)`, 'm'),
+      new RegExp(`^\\s*(?:async\\s+)?${escaped}\\s*\\([^;]*\\)\\s*\\{`, 'm')
+    ];
+
+    for (let i = 0; i < document.lineCount; i++) {
+      if (i + 1 === callLine) continue;
+      const lineText = document.lineAt(i).text;
+      // Combine with next line in case opening brace is on the next line (C# / Allman style)
+      const twoLineText = i + 1 < document.lineCount ? `${lineText}\n${document.lineAt(i + 1).text}` : lineText;
+      if (declPatterns.some(p => p.test(twoLineText))) {
+        return { filePath: docIdentifier, line: i + 1 };
+      }
+    }
+  } catch {}
+
+  // 4. Try Workspace Symbol Provider across workspace files
+  try {
+    const wsSymbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+      'vscode.executeWorkspaceSymbolProvider',
+      fnName
+    );
+    if (wsSymbols && wsSymbols.length > 0) {
+      const fnSym = wsSymbols.find(s =>
+        (s.kind === vscode.SymbolKind.Function || s.kind === vscode.SymbolKind.Method) &&
+        cleanSymbolName(s.name).toLowerCase() === fnName.toLowerCase()
+      );
+      if (fnSym && fnSym.location) {
+        const uri = fnSym.location.uri;
+        return {
+          filePath: uri.scheme === 'untitled' ? uri.toString() : uri.fsPath,
+          line: fnSym.location.range.start.line + 1
+        };
+      }
+    }
+  } catch {}
+
+  return { filePath: docIdentifier, line: callLine };
 }
 
 /**
@@ -182,6 +310,7 @@ export async function harvestContext(
   let isPartialSelection = false;
   let hierarchyTargetPos = selection.start;
   let enclosingSymbol: vscode.DocumentSymbol | null = null;
+  let docSymbols: vscode.DocumentSymbol[] = [];
 
   try {
     const symbols = await vscode.commands.executeCommand<vscode.DocumentSymbol[]>(
@@ -190,9 +319,10 @@ export async function harvestContext(
     );
 
     if (symbols && symbols.length > 0) {
+      docSymbols = symbols;
       enclosingSymbol = findInnermostEnclosingSymbol(symbols, selection);
       if (enclosingSymbol) {
-        enclosingFunctionName = enclosingSymbol.name;
+        enclosingFunctionName = cleanSymbolName(enclosingSymbol.name) || enclosingSymbol.name;
         enclosingStartLine = enclosingSymbol.range.start.line + 1;
         enclosingEndLine = enclosingSymbol.range.end.line + 1;
         hierarchyTargetPos = enclosingSymbol.selectionRange.start;
@@ -206,18 +336,22 @@ export async function harvestContext(
 
   // Fallback function name discovery
   if (!enclosingFunctionName) {
-    const fnMatch = selectedCodeNumbered.match(/(?:function|class|def|fn|func|public|private|protected)\s+([a-zA-Z0-9_$]+)/);
-    if (fnMatch) {
+    const fnMatch = selectedCodeNumbered.match(/(?:function|class|def|fn|func|public|private|protected|internal|static|async|void|int|string|bool)\s+(?:[a-zA-Z0-9_<>[\]?]+\s+)*([a-zA-Z0-9_$]+)\s*\(/);
+    if (fnMatch && !NOISE_FILTER.has(fnMatch[1].toLowerCase())) {
       enclosingFunctionName = fnMatch[1];
     } else {
       enclosingFunctionName = `Block (L${startLine}-L${endLine})`;
     }
   }
 
+  const cleanEnclosing = cleanSymbolName(enclosingFunctionName);
+  const rawSelectedCode = document.getText(selection);
+
   // 2. Call Hierarchy Retrieval & Outgoing Callee Partitioning
   const rawCallersMap = new Map<string, { call: vscode.CallHierarchyIncomingCall; count: number; firstLine: number }>();
   const selectedCallees: CalleeInfo[] = [];
   const otherParentCallees: CalleeInfo[] = [];
+  const seenCalleeNames = new Set<string>();
   let backgroundContext: string | undefined;
   let backgroundType: 'call-hierarchy' | 'enclosing-scope' | 'none' = 'none';
 
@@ -244,7 +378,7 @@ export async function harvestContext(
       // Deduplicate incoming callers - collect all without truncation
       if (incoming && incoming.length > 0) {
         for (const call of incoming) {
-          const name = call.from.name;
+          const name = cleanSymbolName(call.from.name) || call.from.name;
           if (NOISE_FILTER.has(name.toLowerCase())) continue;
 
           const callerUriStr = call.from.uri.scheme === 'untitled' ? call.from.uri.toString() : call.from.uri.fsPath;
@@ -267,20 +401,39 @@ export async function harvestContext(
       // Partition Outgoing Callees based on selection overlap
       if (outgoing && outgoing.length > 0) {
         for (const call of outgoing) {
-          const name = call.to.name;
+          const name = cleanSymbolName(call.to.name) || call.to.name;
           if (NOISE_FILTER.has(name.toLowerCase())) continue;
 
-          const calledLines = (call.fromRanges || []).map(r => r.start.line + 1);
-          const isInsideSelection = calledLines.some(l => l >= startLine && l <= endLine);
+          let calledLines = (call.fromRanges || []).map(r => r.start.line + 1);
+          let isInsideSelection = calledLines.some(l => l >= startLine && l <= endLine);
+
+          // If LSP fromRanges was empty or pointed to enclosing declaration, verify against selected lines directly
+          if (!isInsideSelection && name) {
+            const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const invokeRe = new RegExp(`\\b${escaped}\\s*\\(`);
+            for (let l = selection.start.line; l <= selection.end.line; l++) {
+              const lineNum = l + 1;
+              if (lineNum === enclosingStartLine && name.toLowerCase() === cleanEnclosing.toLowerCase()) continue;
+              if (invokeRe.test(document.lineAt(l).text)) {
+                isInsideSelection = true;
+                if (!calledLines.includes(lineNum)) {
+                  calledLines.push(lineNum);
+                }
+              }
+            }
+          }
+
           const calleePath = call.to.uri.scheme === 'untitled' ? call.to.uri.toString() : call.to.uri.fsPath;
+          const defLine = (call.to.selectionRange?.start.line ?? call.to.range.start.line) + 1;
 
           const calleeItem: CalleeInfo = {
             name,
             filePath: calleePath,
-            line: call.to.range.start.line + 1,
+            line: defLine,
             calledFromLines: calledLines.length > 0 ? calledLines : [startLine]
           };
 
+          seenCalleeNames.add(name.toLowerCase());
           if (isInsideSelection) {
             selectedCallees.push(calleeItem);
           } else {
@@ -293,27 +446,42 @@ export async function harvestContext(
     }
   } catch {}
 
-  // 3. Fallback Callee Scanning if LSP outgoing calls returned nothing
-  if (selectedCallees.length === 0) {
-    const rawCode = document.getText(selection);
+  // 3. Fallback / Supplemental Callee Scanning + Definition Resolution
+  {
     const callRegex = /\b([a-zA-Z_]\w*)\s*\(/g;
     let match: RegExpExecArray | null;
-    const seenCallees = new Set<string>();
 
-    while ((match = callRegex.exec(rawCode)) !== null) {
+    while ((match = callRegex.exec(rawSelectedCode)) !== null) {
       const fnName = match[1];
-      if (!NOISE_FILTER.has(fnName.toLowerCase()) && !seenCallees.has(fnName) && fnName !== enclosingFunctionName) {
-        seenCallees.add(fnName);
-        const matchPos = document.positionAt(document.offsetAt(selection.start) + match.index);
-        const callLine = matchPos.line + 1;
+      const lowerFn = fnName.toLowerCase();
+      if (NOISE_FILTER.has(lowerFn) || seenCalleeNames.has(lowerFn)) continue;
 
-        selectedCallees.push({
-          name: fnName,
-          filePath: docIdentifier,
-          line: callLine,
-          calledFromLines: [callLine]
-        });
-      }
+      const matchPos = document.positionAt(document.offsetAt(selection.start) + match.index);
+      const callLine = matchPos.line + 1;
+
+      // Skip if this match is the enclosing function's own declaration header
+      const lineText = document.lineAt(matchPos.line).text;
+      const isOwnDeclaration =
+        fnName.toLowerCase() === cleanEnclosing.toLowerCase() &&
+        (callLine === enclosingStartLine || /(?:function|def|fn|func|public|private|protected|internal|static|void|int|string|bool)\s+/.test(lineText));
+      if (isOwnDeclaration) continue;
+
+      seenCalleeNames.add(lowerFn);
+      const resolvedDef = await resolveCalleeDefinition(
+        document,
+        docIdentifier,
+        docSymbols,
+        fnName,
+        matchPos,
+        callLine
+      );
+
+      selectedCallees.push({
+        name: fnName,
+        filePath: resolvedDef.filePath,
+        line: resolvedDef.line,
+        calledFromLines: [callLine]
+      });
     }
 
     if (isPartialSelection && enclosingStartLine && enclosingEndLine) {
@@ -325,18 +493,27 @@ export async function harvestContext(
         let m2: RegExpExecArray | null;
         while ((m2 = callRegex.exec(fullFnCode)) !== null) {
           const fnName = m2[1];
-          if (!NOISE_FILTER.has(fnName.toLowerCase()) && !seenCallees.has(fnName) && fnName !== enclosingFunctionName) {
-            seenCallees.add(fnName);
-            const pos = document.positionAt(document.offsetAt(fullFnStart) + m2.index);
-            const line = pos.line + 1;
-            if (line < startLine || line > endLine) {
-              otherParentCallees.push({
-                name: fnName,
-                filePath: docIdentifier,
-                line,
-                calledFromLines: [line]
-              });
-            }
+          const lowerFn = fnName.toLowerCase();
+          if (NOISE_FILTER.has(lowerFn) || seenCalleeNames.has(lowerFn) || lowerFn === cleanEnclosing.toLowerCase()) continue;
+
+          const pos = document.positionAt(document.offsetAt(fullFnStart) + m2.index);
+          const line = pos.line + 1;
+          if (line < startLine || line > endLine) {
+            seenCalleeNames.add(lowerFn);
+            const resolvedDef = await resolveCalleeDefinition(
+              document,
+              docIdentifier,
+              docSymbols,
+              fnName,
+              pos,
+              line
+            );
+            otherParentCallees.push({
+              name: fnName,
+              filePath: resolvedDef.filePath,
+              line: resolvedDef.line,
+              calledFromLines: [line]
+            });
           }
         }
       } catch {}
@@ -344,27 +521,34 @@ export async function harvestContext(
   }
 
   // Fallback Caller Scanning if LSP incoming calls returned nothing
-  if (rawCallersMap.size === 0 && enclosingFunctionName && !enclosingFunctionName.startsWith('Block (')) {
+  if (rawCallersMap.size === 0 && cleanEnclosing && !cleanEnclosing.startsWith('Block (')) {
     try {
       const docText = document.getText();
-      const escapedFnName = enclosingFunctionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const escapedFnName = cleanEnclosing.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       const callerRegex = new RegExp(`\\b${escapedFnName}\\s*\\(`, 'g');
       let m: RegExpExecArray | null;
+
+      const bodyStart = enclosingStartLine || startLine;
+      const bodyEnd = enclosingEndLine || endLine;
 
       while ((m = callerRegex.exec(docText)) !== null) {
         const callerPos = document.positionAt(m.index);
         const callerLine = callerPos.line + 1;
-        if (callerLine < startLine || callerLine > endLine) {
+        if (callerLine < bodyStart || callerLine > bodyEnd) {
           const snippet = document.lineAt(callerPos.line).text.trim();
-          const key = `${docIdentifier}::line_${callerLine}`;
+          const callerSym = docSymbols.length > 0
+            ? findInnermostEnclosingSymbol(docSymbols, new vscode.Range(callerPos, callerPos))
+            : null;
+          const callerFnName = callerSym ? (cleanSymbolName(callerSym.name) || callerSym.name) : `Caller (L${callerLine})`;
+          const key = `${docIdentifier}::${callerFnName}_${callerLine}`;
           rawCallersMap.set(key, {
             call: {
               from: {
-                name: `Caller (L${callerLine})`,
+                name: callerFnName,
                 kind: vscode.SymbolKind.Function,
                 uri: document.uri,
-                range: new vscode.Range(callerPos, callerPos),
-                selectionRange: new vscode.Range(callerPos, callerPos),
+                range: callerSym ? callerSym.range : new vscode.Range(callerPos, callerPos),
+                selectionRange: callerSym ? callerSym.selectionRange : new vscode.Range(callerPos, callerPos),
                 detail: snippet
               },
               fromRanges: [new vscode.Range(callerPos, callerPos)]

@@ -80,6 +80,26 @@ export function compileDeterministicMermaid(
     idMap.set(n.id, safeId(n.id, idx));
   });
 
+  // Ensure edges reference valid nodes; if no valid edges exist for multi-node flow, chain sequentially
+  const validNodeIds = new Set(Array.from(idMap.values()));
+  let resolvedEdges: { from: string; to: string; guardLabel?: string }[] = [];
+
+  for (const edge of edges) {
+    const from = idMap.get(edge.from) || edge.from.replace(/[^a-zA-Z0-9_]/g, '');
+    const to = idMap.get(edge.to) || edge.to.replace(/[^a-zA-Z0-9_]/g, '');
+    if (validNodeIds.has(from) && validNodeIds.has(to) && from !== to) {
+      resolvedEdges.push({ from, to, guardLabel: edge.guardLabel });
+    }
+  }
+
+  if (resolvedEdges.length === 0 && nodes.length > 1) {
+    for (let i = 0; i < nodes.length - 1; i++) {
+      const from = idMap.get(nodes[i].id) || `N${i + 1}`;
+      const to = idMap.get(nodes[i + 1].id) || `N${i + 2}`;
+      resolvedEdges.push({ from, to });
+    }
+  }
+
   if (diagramType === 'stateDiagram-v2') {
     lines.push('stateDiagram-v2');
     nodes.forEach((node, idx) => {
@@ -87,11 +107,9 @@ export function compileDeterministicMermaid(
       const label = sanitizeMermaidLabel(node.label);
       lines.push(`    state "${label}" as ${nid}`);
     });
-    edges.forEach((edge) => {
-      const from = idMap.get(edge.from) || edge.from;
-      const to = idMap.get(edge.to) || edge.to;
+    resolvedEdges.forEach((edge) => {
       const guard = edge.guardLabel ? ` : ${sanitizeMermaidLabel(edge.guardLabel)}` : '';
-      lines.push(`    ${from} --> ${to}${guard}`);
+      lines.push(`    ${edge.from} --> ${edge.to}${guard}`);
     });
   } else if (diagramType === 'sequenceDiagram') {
     lines.push('sequenceDiagram');
@@ -101,11 +119,9 @@ export function compileDeterministicMermaid(
       const label = sanitizeMermaidLabel(node.label);
       lines.push(`    participant ${nid} as ${label}`);
     });
-    edges.forEach((edge) => {
-      const from = idMap.get(edge.from) || edge.from;
-      const to = idMap.get(edge.to) || edge.to;
-      const guard = sanitizeMermaidLabel(edge.guardLabel || 'call');
-      lines.push(`    ${from}->>${to}: ${guard}`);
+    resolvedEdges.forEach((edge) => {
+      const guard = sanitizeMermaidLabel(edge.guardLabel || 'step');
+      lines.push(`    ${edge.from}->>${edge.to}: ${guard}`);
     });
   } else {
     // Default: flowchart TD
@@ -115,14 +131,12 @@ export function compileDeterministicMermaid(
       const label = sanitizeMermaidLabel(node.label);
       lines.push(`    ${nid}["${label}"]`);
     });
-    edges.forEach((edge) => {
-      const from = idMap.get(edge.from) || edge.from;
-      const to = idMap.get(edge.to) || edge.to;
+    resolvedEdges.forEach((edge) => {
       if (edge.guardLabel && edge.guardLabel.trim().length > 0) {
         const guard = sanitizeMermaidLabel(edge.guardLabel);
-        lines.push(`    ${from} -->|"${guard}"| ${to}`);
+        lines.push(`    ${edge.from} -->|"${guard}"| ${edge.to}`);
       } else {
-        lines.push(`    ${from} --> ${to}`);
+        lines.push(`    ${edge.from} --> ${edge.to}`);
       }
     });
   }
@@ -179,6 +193,9 @@ export async function analyzeSelectionWithLLM(
     `- "${c.name}" (invoked at lines: ${c.calledFromLines.join(', ')})`
   ).join('\n') || 'None detected';
 
+  const midLine1 = Math.min(context.endLine, context.startLine + Math.max(1, Math.floor((context.endLine - context.startLine) * 0.3)));
+  const midLine2 = Math.min(context.endLine, context.startLine + Math.max(2, Math.floor((context.endLine - context.startLine) * 0.65)));
+
   const systemPrompt = `You are CodeMist, a visual code comprehension engine.
 CRITICAL CONSTRAINT: You must ONLY explain, diagram, and trace the user's SELECTED lines (from line ${context.startLine} to line ${context.endLine}).
 ${context.isPartialSelection ? `The user highlighted a sub-block inside parent function "${context.enclosingFunctionName}". Focus strictly on the highlighted lines.` : ''}
@@ -187,44 +204,84 @@ RULES:
 1. Return ONLY a single raw valid JSON object.
 2. ALWAYS use standard double quotes (") for all keys and strings. Never use single quotes (').
 3. Keep descriptions concise (under 15 words per bullet or explanation).
-4. Output 3 to 6 logical step nodes. All startLine and endLine numbers MUST be between ${context.startLine} and ${context.endLine}.
+4. INTERNAL FUNCTIONAL FLOW (CRITICAL): NEVER collapse the code into a single node! You MUST break the selected code down into 4 to 7 granular internal control-flow nodes representing its internal steps:
+   - Entry / variable initialization
+   - Every conditional check (if / else if / switch) as its own node with outgoing "Yes" and "No" guardLabel edges
+   - Loop bodies (for / while / foreach)
+   - Downstream function/method calls and state mutations
+   - Return / throw / output paths
+   Each node MUST have narrow, specific startLine and endLine numbers between ${context.startLine} and ${context.endLine}.
 5. Upstream Callers: From the "Candidate Upstream Callers" provided, pick the Top 3 to 5 most architecturally distinct callers. Assign each:
    - "flowTag": choose from "Hot Path", "Init", "Callback", "Error/Retry", "Handler", or "Worker"
    - "roleHint": concise trigger explanation (under 8 words).
    Return these under "primaryCallers".
 6. Downstream Callees: For each callee in "Selected Callees", assign:
    - "roleHint": concise intent (under 8 words)
-   - "nodeId": tag it with the Mermaid step id (e.g. "N1", "N2") where it is invoked.
+   - "nodeId": tag it with the exact Mermaid step id (e.g. "N2", "N3") where it is invoked.
 
 Schema:
 {
   "summary": [
-    "First crisp bullet point explaining the selected code",
-    "Second crisp bullet point explaining key operations or mutations",
-    "Third crisp bullet point explaining the return value or outcome"
+    "First crisp bullet point explaining the selected code's primary purpose",
+    "Second crisp bullet point explaining internal branches, calls, or state changes",
+    "Third crisp bullet point explaining the return value or side effects"
   ],
   "diagramType": "flowchart TD",
   "nodes": [
     {
       "id": "N1",
-      "label": "Short label (max 5 words)",
+      "label": "Initialize inputs & state",
       "startLine": ${context.startLine},
+      "endLine": ${midLine1},
+      "explanation": "Sets up initial variables and validates parameters"
+    },
+    {
+      "id": "N2",
+      "label": "Check branch condition",
+      "startLine": ${midLine1},
+      "endLine": ${midLine2},
+      "explanation": "Evaluates guard or branching condition"
+    },
+    {
+      "id": "N3",
+      "label": "Execute core operation / call",
+      "startLine": ${midLine2},
       "endLine": ${context.endLine},
-      "explanation": "Brief explanation"
+      "explanation": "Invokes downstream logic and computes result"
+    },
+    {
+      "id": "N4",
+      "label": "Return final result",
+      "startLine": ${context.endLine},
+      "endLine": ${context.endLine},
+      "explanation": "Returns computed output to caller"
     }
   ],
   "edges": [
     {
       "from": "N1",
-      "to": "N2",
-      "guardLabel": "condition (optional)"
+      "to": "N2"
+    },
+    {
+      "from": "N2",
+      "to": "N3",
+      "guardLabel": "Yes"
+    },
+    {
+      "from": "N2",
+      "to": "N4",
+      "guardLabel": "No"
+    },
+    {
+      "from": "N3",
+      "to": "N4"
     }
   ],
   "whatIfTraces": [
     {
       "title": "Edge Case Name",
       "triggerInput": "Concrete input value",
-      "pathNodeIds": ["N1"],
+      "pathNodeIds": ["N1", "N2", "N3", "N4"],
       "potentialBlindSpot": "Brief risk description",
       "targetLines": [${context.startLine}, ${context.endLine}]
     }
@@ -240,7 +297,7 @@ Schema:
     {
       "name": "calleeName",
       "roleHint": "role hint under 8 words",
-      "nodeId": "N1"
+      "nodeId": "N3"
     }
   ]
 }`;
@@ -526,6 +583,220 @@ function normalizeSummary(rawSummary: any): [string, string, string] {
 }
 
 /**
+ * Deterministically decomposes numbered source lines into internal control-flow nodes and edges
+ * whenever the LLM returns <= 1 node for a multi-statement function/block.
+ */
+function buildInternalFlowFromCode(context: HarvestedContext): { nodes: AnalysisNode[]; edges: AnalysisEdge[] } {
+  const rawLines = context.selectedCodeNumbered.split(/\r?\n/);
+  const parsedLines: { lineNum: number; code: string }[] = [];
+
+  for (const rl of rawLines) {
+    const m = rl.match(/^\[L(\d+)\]:\s*(.*)$/);
+    if (m) {
+      const lineNum = Number(m[1]);
+      const code = m[2].trim();
+      // Skip blank lines, standalone braces, and pure comment lines
+      if (!code || /^[{}()[\];]+$/.test(code) || /^(\/\/|#|\/\*|\*)/.test(code)) {
+        continue;
+      }
+      parsedLines.push({ lineNum, code });
+    }
+  }
+
+  if (parsedLines.length === 0) {
+    return {
+      nodes: [{
+        id: 'N1',
+        label: context.enclosingFunctionName || 'Selected Block',
+        startLine: context.startLine,
+        endLine: context.endLine,
+        explanation: 'Selected execution block'
+      }],
+      edges: []
+    };
+  }
+
+  interface StepItem {
+    id: string;
+    kind: 'entry' | 'branch' | 'else' | 'loop' | 'try' | 'catch' | 'return' | 'action';
+    label: string;
+    startLine: number;
+    endLine: number;
+    explanation: string;
+  }
+
+  const steps: StepItem[] = [];
+  let idx = 0;
+
+  const summarizeStmt = (stmt: string): string => {
+    const cleaned = stmt.replace(/[{};]+$/g, '').trim();
+    return cleaned.length > 52 ? cleaned.slice(0, 49) + '...' : cleaned;
+  };
+
+  for (let i = 0; i < parsedLines.length; i++) {
+    const { lineNum, code } = parsedLines[i];
+
+    // 1. Function signature / entry
+    if (i === 0 && /(?:function|def|fn|func|public|private|protected|internal|static|async|void|int|string|bool)\b/.test(code) && code.includes('(')) {
+      idx++;
+      steps.push({
+        id: `N${idx}`,
+        kind: 'entry',
+        label: `Enter ${context.enclosingFunctionName || 'Function'}`,
+        startLine: lineNum,
+        endLine: lineNum,
+        explanation: summarizeStmt(code)
+      });
+      continue;
+    }
+
+    // 2. Conditional branch (if / else if / switch / case)
+    const branchMatch = code.match(/^(?:}\s*)?(else\s+if|elif|if|switch|case)\b\s*(.*)$/);
+    if (branchMatch) {
+      idx++;
+      const kw = branchMatch[1].replace(/\s+/g, ' ');
+      const cond = summarizeStmt(branchMatch[2] || code);
+      steps.push({
+        id: `N${idx}`,
+        kind: 'branch',
+        label: `${kw}: ${cond}`,
+        startLine: lineNum,
+        endLine: lineNum,
+        explanation: `Evaluates condition ${cond}`
+      });
+      continue;
+    }
+
+    // 3. Else branch
+    if (/^(?:}\s*)?else\b/.test(code)) {
+      idx++;
+      const rest = summarizeStmt(code.replace(/^(?:}\s*)?else\b\s*/, ''));
+      steps.push({
+        id: `N${idx}`,
+        kind: 'else',
+        label: rest ? `Else: ${rest}` : 'Else branch',
+        startLine: lineNum,
+        endLine: lineNum,
+        explanation: 'Fallback branch when condition is false'
+      });
+      continue;
+    }
+
+    // 4. Loop (for / while / foreach)
+    const loopMatch = code.match(/^(for\s*each|foreach|for|while)\b\s*(.*)$/);
+    if (loopMatch) {
+      idx++;
+      const cond = summarizeStmt(loopMatch[2] || code);
+      steps.push({
+        id: `N${idx}`,
+        kind: 'loop',
+        label: `Loop: ${cond}`,
+        startLine: lineNum,
+        endLine: lineNum,
+        explanation: `Iterates while ${cond}`
+      });
+      continue;
+    }
+
+    // 5. Try / Catch
+    if (/^(?:}\s*)?catch\b/.test(code)) {
+      idx++;
+      steps.push({
+        id: `N${idx}`,
+        kind: 'catch',
+        label: summarizeStmt(code),
+        startLine: lineNum,
+        endLine: lineNum,
+        explanation: 'Handles exception in catch block'
+      });
+      continue;
+    }
+
+    // 6. Return / Throw
+    if (/^(return|throw)\b/.test(code)) {
+      idx++;
+      steps.push({
+        id: `N${idx}`,
+        kind: 'return',
+        label: summarizeStmt(code),
+        startLine: lineNum,
+        endLine: lineNum,
+        explanation: `Exits with: ${summarizeStmt(code)}`
+      });
+      continue;
+    }
+
+    // 7. Action / Call / Assignment: merge consecutive simple action lines if we already have many steps
+    const prev = steps[steps.length - 1];
+    const hasCalleeCall = context.selectedCallees.some(c => c.calledFromLines.includes(lineNum));
+    if (prev && prev.kind === 'action' && !hasCalleeCall && steps.length >= 5) {
+      prev.endLine = lineNum;
+    } else {
+      idx++;
+      steps.push({
+        id: `N${idx}`,
+        kind: 'action',
+        label: summarizeStmt(code),
+        startLine: lineNum,
+        endLine: lineNum,
+        explanation: summarizeStmt(code)
+      });
+    }
+  }
+
+  // Cap at 8 nodes for visual clarity by merging adjacent action nodes if needed
+  while (steps.length > 8) {
+    const mergeIdx = steps.findIndex((s, i) => i > 0 && s.kind === 'action' && steps[i - 1].kind === 'action');
+    if (mergeIdx !== -1) {
+      steps[mergeIdx - 1].endLine = steps[mergeIdx].endLine;
+      steps.splice(mergeIdx, 1);
+    } else {
+      break;
+    }
+  }
+
+  // Re-number IDs N1..Nk
+  steps.forEach((s, i) => {
+    s.id = `N${i + 1}`;
+  });
+
+  // Build control-flow edges (including branch Yes/No paths)
+  const edges: AnalysisEdge[] = [];
+  for (let i = 0; i < steps.length - 1; i++) {
+    const curr = steps[i];
+    const next = steps[i + 1];
+
+    if (curr.kind === 'branch') {
+      edges.push({ from: curr.id, to: next.id, guardLabel: 'Yes' });
+      // Find corresponding 'else' or join node for the 'No' path
+      const elseIdx = steps.findIndex((s, j) => j > i + 1 && (s.kind === 'else' || s.kind === 'branch' || s.kind === 'return'));
+      if (elseIdx !== -1) {
+        edges.push({ from: curr.id, to: steps[elseIdx].id, guardLabel: 'No' });
+      }
+    } else if (curr.kind === 'return') {
+      // Return exits; only link if no incoming edge exists on next
+      const nextHasIncoming = edges.some(e => e.to === next.id);
+      if (!nextHasIncoming) {
+        edges.push({ from: curr.id, to: next.id });
+      }
+    } else {
+      edges.push({ from: curr.id, to: next.id });
+    }
+  }
+
+  return {
+    nodes: steps.map(s => ({
+      id: s.id,
+      label: s.label,
+      startLine: s.startLine,
+      endLine: s.endLine,
+      explanation: s.explanation
+    })),
+    edges
+  };
+}
+
+/**
  * Extracts and cleans JSON from LLM output, with ranking funnel resolution and un-truncated collections.
  */
 function parseLLMJsonResponse(raw: string, context: HarvestedContext): StructuredAnalysis {
@@ -536,29 +807,35 @@ function parseLLMJsonResponse(raw: string, context: HarvestedContext): Structure
   const validTypes = ['flowchart TD', 'stateDiagram-v2', 'sequenceDiagram'] as const;
   const diagramType = validTypes.includes(parsed.diagramType) ? parsed.diagramType : 'flowchart TD';
 
-  const nodes: AnalysisNode[] = (Array.isArray(parsed.nodes) ? parsed.nodes : []).map((n: any, idx: number) => ({
+  const rawNodesList = Array.isArray(parsed.nodes)
+    ? parsed.nodes
+    : (Array.isArray(parsed.steps) ? parsed.steps : (Array.isArray(parsed.blocks) ? parsed.blocks : []));
+
+  let nodes: AnalysisNode[] = rawNodesList.map((n: any, idx: number) => ({
     id: String(n.id || `N${idx + 1}`),
-    label: String(n.label || n.title || `Step ${idx + 1}`),
-    startLine: Number(n.startLine) || context.startLine,
-    endLine: Number(n.endLine) || context.endLine,
-    explanation: String(n.explanation || n.label || '')
+    label: String(n.label || n.title || n.name || `Step ${idx + 1}`),
+    startLine: Number(n.startLine || n.line) || context.startLine,
+    endLine: Number(n.endLine || n.startLine || n.line) || context.endLine,
+    explanation: String(n.explanation || n.description || n.label || '')
   }));
 
-  if (nodes.length === 0) {
-    nodes.push({
-      id: 'N1',
-      label: 'Selected Execution Block',
-      startLine: context.startLine,
-      endLine: context.endLine,
-      explanation: 'Block of selected lines'
-    });
-  }
-
-  const edges: AnalysisEdge[] = (Array.isArray(parsed.edges) ? parsed.edges : []).map((e: any) => ({
+  let edges: AnalysisEdge[] = (Array.isArray(parsed.edges) ? parsed.edges : []).map((e: any) => ({
     from: String(e.from || e.source || 'N1'),
     to: String(e.to || e.target || 'N2'),
     guardLabel: e.guardLabel || e.label || e.explanation || e.guard ? String(e.guardLabel || e.label || e.explanation || e.guard) : undefined
   }));
+
+  // If the LLM collapsed a multi-statement block into <= 1 node, use deterministic internal control-flow decomposition
+  if (nodes.length <= 1) {
+    const internalFlow = buildInternalFlowFromCode(context);
+    if (internalFlow.nodes.length > nodes.length) {
+      nodes = internalFlow.nodes;
+      edges = internalFlow.edges;
+    } else if (nodes.length === 0) {
+      nodes = internalFlow.nodes;
+      edges = internalFlow.edges;
+    }
+  }
 
   const rawTraces = Array.isArray(parsed.whatIfTraces) ? parsed.whatIfTraces : [];
   const whatIfTraces: [WhatIfTrace, WhatIfTrace, WhatIfTrace] = [
