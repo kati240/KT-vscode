@@ -169,10 +169,23 @@ async function resolveExploredFunctionRange(
   return new vscode.Range(declLine, 0, endL, doc.lineAt(endL).text.length);
 }
 
+function isCodeEditor(editor?: vscode.TextEditor): editor is vscode.TextEditor {
+  if (!editor) return false;
+  const scheme = editor.document.uri.scheme;
+  return scheme !== 'output' && scheme !== 'debug' && scheme !== 'vscode-terminal';
+}
+
 export function activate(context: vscode.ExtensionContext) {
-  // Track last active editor and selection so clicking in the sidebar never loses selection
-  let lastActiveEditor = vscode.window.activeTextEditor;
-  let lastSelection: vscode.Selection | undefined = lastActiveEditor?.selection;
+  // Track last active editor and selection so clicking in the sidebar or right-clicking never loses selection
+  const initialEditors = vscode.window.visibleTextEditors.filter(isCodeEditor);
+  let lastActiveEditor: vscode.TextEditor | undefined =
+    (isCodeEditor(vscode.window.activeTextEditor) ? vscode.window.activeTextEditor : undefined) ||
+    initialEditors.find(e => !e.selection.isEmpty) ||
+    initialEditors[0];
+
+  let lastSelection: vscode.Selection | undefined =
+    lastActiveEditor && !lastActiveEditor.selection.isEmpty ? lastActiveEditor.selection : undefined;
+  let lastSelectionTime = lastSelection ? Date.now() : 0;
 
   // Register CodeMist Sidebar Provider
   const sidebarProvider = new CodeMistSidebarProvider(context.extensionUri);
@@ -214,7 +227,11 @@ export function activate(context: vscode.ExtensionContext) {
   // Wire up Expand to Full Function handler
   sidebarProvider.onExpandToFullFunctionHandler = async (startLine: number, endLine: number) => {
     try {
-      let editor = vscode.window.activeTextEditor || lastActiveEditor || vscode.window.visibleTextEditors[0];
+      const visibleCodeEditors = vscode.window.visibleTextEditors.filter(isCodeEditor);
+      let editor =
+        (isCodeEditor(vscode.window.activeTextEditor) ? vscode.window.activeTextEditor : undefined) ||
+        lastActiveEditor ||
+        visibleCodeEditors[0];
       if (!editor) return;
 
       const doc = editor.document;
@@ -233,18 +250,20 @@ export function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor((editor) => {
-      if (editor) {
+      if (isCodeEditor(editor)) {
         lastActiveEditor = editor;
         if (!editor.selection.isEmpty) {
           lastSelection = editor.selection;
+          lastSelectionTime = Date.now();
         }
       }
     }),
     vscode.window.onDidChangeTextEditorSelection((event) => {
-      if (event.textEditor) {
+      if (isCodeEditor(event.textEditor)) {
         lastActiveEditor = event.textEditor;
         if (!event.selections[0]?.isEmpty) {
           lastSelection = event.selections[0];
+          lastSelectionTime = Date.now();
         }
 
         // Reverse Cursor Sync: notify Webview of cursor line in active file
@@ -270,15 +289,40 @@ export function activate(context: vscode.ExtensionContext) {
   const explainCommand = vscode.commands.registerCommand(
     'codemist.explainSelection',
     async () => {
-      let editor = vscode.window.activeTextEditor || lastActiveEditor || vscode.window.visibleTextEditors[0];
+      const visibleCodeEditors = vscode.window.visibleTextEditors.filter(isCodeEditor);
+      let editor =
+        visibleCodeEditors.find(e => !e.selection.isEmpty) ||
+        (isCodeEditor(vscode.window.activeTextEditor) ? vscode.window.activeTextEditor : undefined) ||
+        lastActiveEditor ||
+        visibleCodeEditors[0];
+
       if (!editor) {
         vscode.window.showWarningMessage('CodeMist: Please open a file in the editor to explain.');
         return;
       }
 
       let relevantSelection: vscode.Selection | undefined;
-      if (lastSelection && lastActiveEditor?.document.uri.toString() === editor.document.uri.toString()) {
+      if (!editor.selection.isEmpty) {
+        relevantSelection = editor.selection;
+      } else if (
+        lastSelection &&
+        !lastSelection.isEmpty &&
+        lastActiveEditor?.document.uri.toString() === editor.document.uri.toString() &&
+        (Date.now() - lastSelectionTime < 15000 ||
+          (editor.selection.active.line >= lastSelection.start.line - 2 &&
+           editor.selection.active.line <= lastSelection.end.line + 2))
+      ) {
         relevantSelection = lastSelection;
+      } else {
+        // Cursor is in the editor without a selection: automatically resolve the enclosing function range
+        const cursorLine = (editor.selection.active?.line ?? 0) + 1;
+        const autoRange = await resolveExploredFunctionRange(
+          editor.document,
+          editor.document.uri,
+          cursorLine,
+          ''
+        );
+        relevantSelection = new vscode.Selection(autoRange.start, autoRange.end);
       }
 
       const harvested = await harvestContext(editor, relevantSelection);
