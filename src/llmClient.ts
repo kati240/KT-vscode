@@ -102,6 +102,17 @@ export function compileDeterministicMermaid(
       const to = idMap.get(nodes[i + 1].id) || `N${i + 2}`;
       resolvedEdges.push({ from, to });
     }
+  } else if (nodes.length > 1) {
+    // Connect any orphan nodes (nodes with 0 incoming edges after N1) so no box floats disconnected
+    const hasIncoming = new Set<string>(resolvedEdges.map(e => e.to));
+    for (let i = 1; i < nodes.length; i++) {
+      const currId = idMap.get(nodes[i].id) || `N${i + 1}`;
+      const prevId = idMap.get(nodes[i - 1].id) || `N${i}`;
+      if (!hasIncoming.has(currId) && currId !== prevId) {
+        resolvedEdges.push({ from: prevId, to: currId });
+        hasIncoming.add(currId);
+      }
+    }
   }
 
   if (diagramType === 'stateDiagram-v2') {
@@ -183,11 +194,28 @@ export async function analyzeSelectionWithLLM(
   token?: vscode.CancellationToken
 ): Promise<AnalysisResult> {
   const config = vscode.workspace.getConfiguration('codemist');
-  const endpoint = config.get<string>('apiEndpoint', 'http://localhost:11434/v1/chat/completions');
-  const apiKey = config.get<string>('apiKey', '');
-  const rawModelName = config.get<string>('modelName', 'gemma4:latest');
+  let endpoint = config.get<string>('apiEndpoint', 'http://localhost:11434/v1/chat/completions').trim();
+  const apiKey = config.get<string>('apiKey', '').trim();
+  const rawModelName = config.get<string>('modelName', 'gemma4:latest').trim();
 
-  const modelName = await resolveOllamaModel(rawModelName, endpoint);
+  // Auto-detect Gemini or OpenAI API keys if endpoint is still set to default localhost
+  const isGeminiKey = apiKey.startsWith('AIza') || endpoint.includes('googleapis.com') || rawModelName.toLowerCase().startsWith('gemini');
+  const isOpenAIKey = apiKey.startsWith('sk-') && !endpoint.includes('googleapis.com');
+
+  let modelName: string;
+  if (isGeminiKey) {
+    if (endpoint.includes('localhost') || endpoint.includes('127.0.0.1') || !endpoint) {
+      endpoint = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
+    }
+    modelName = rawModelName.toLowerCase().startsWith('gemini') ? rawModelName : 'gemini-2.5-flash';
+  } else if (isOpenAIKey) {
+    if (endpoint.includes('localhost') || endpoint.includes('127.0.0.1') || !endpoint) {
+      endpoint = 'https://api.openai.com/v1/chat/completions';
+    }
+    modelName = (rawModelName === 'gemma4:latest' || rawModelName.includes(':')) ? 'gpt-4o-mini' : rawModelName;
+  } else {
+    modelName = await resolveOllamaModel(rawModelName, endpoint);
+  }
 
   // Format candidate production callers for LLM selection
   const candidateCallersStr = context.candidateProductionCallers.map((c, i) =>
@@ -328,6 +356,7 @@ ${context.backgroundContext ? `Background Scope Context:\n${context.backgroundCo
     headers['Authorization'] = `Bearer ${apiKey.trim()}`;
   }
 
+  const isLocalOllama = endpoint.includes('11434');
   const requestBody: Record<string, unknown> = {
     model: modelName,
     messages: [
@@ -336,12 +365,15 @@ ${context.backgroundContext ? `Background Scope Context:\n${context.backgroundCo
     ],
     temperature: 0.1,
     max_tokens: 2048,
-    response_format: { type: 'json_object' },
-    options: {
+    response_format: { type: 'json_object' }
+  };
+
+  if (isLocalOllama) {
+    requestBody.options = {
       num_predict: 2048,
       temperature: 0.1
-    }
-  };
+    };
+  }
 
   let responseText = '';
   try {
@@ -354,6 +386,7 @@ ${context.backgroundContext ? `Background Scope Context:\n${context.backgroundCo
     if (!res.ok) {
       if (res.status === 400) {
         delete requestBody.response_format;
+        delete requestBody.options;
         const retryRes = await fetch(endpoint, {
           method: 'POST',
           headers,
