@@ -47,17 +47,21 @@ export interface AnalysisResult extends StructuredAnalysis {
 
 /**
  * Sanitizes a label string for safe insertion into Mermaid syntax.
+ * Guarantees a non-empty return value so Mermaid never sees `N1[""]` (which throws a SQE parse error).
  */
-export function sanitizeMermaidLabel(raw: string): string {
-  if (!raw) return 'Step';
-  return raw
+export function sanitizeMermaidLabel(raw: string, fallback = 'Step'): string {
+  if (!raw) return fallback;
+  const cleaned = String(raw)
     .replace(/"/g, "'")
+    .replace(/`/g, "'")
     .replace(/[\[\]\(\)\{\}]/g, ' ')
-    .replace(/<[^>]*>/g, '') // remove HTML tags
-    .replace(/[;:#|]/g, ' ')
+    .replace(/[<>]/g, ' ')
+    .replace(/[;:#|\\]/g, ' ')
+    .replace(/\r?\n/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 80);
+  return cleaned.length > 0 ? cleaned : fallback;
 }
 
 /**
@@ -104,11 +108,12 @@ export function compileDeterministicMermaid(
     lines.push('stateDiagram-v2');
     nodes.forEach((node, idx) => {
       const nid = idMap.get(node.id) || `N${idx + 1}`;
-      const label = sanitizeMermaidLabel(node.label);
+      const label = sanitizeMermaidLabel(node.label, `Step ${idx + 1} L${node.startLine}`);
       lines.push(`    state "${label}" as ${nid}`);
     });
     resolvedEdges.forEach((edge) => {
-      const guard = edge.guardLabel ? ` : ${sanitizeMermaidLabel(edge.guardLabel)}` : '';
+      const guardText = edge.guardLabel ? sanitizeMermaidLabel(edge.guardLabel, '') : '';
+      const guard = guardText ? ` : ${guardText}` : '';
       lines.push(`    ${edge.from} --> ${edge.to}${guard}`);
     });
   } else if (diagramType === 'sequenceDiagram') {
@@ -116,11 +121,11 @@ export function compileDeterministicMermaid(
     lines.push('    autonumber');
     nodes.forEach((node, idx) => {
       const nid = idMap.get(node.id) || `N${idx + 1}`;
-      const label = sanitizeMermaidLabel(node.label);
+      const label = sanitizeMermaidLabel(node.label, `Step ${idx + 1}`);
       lines.push(`    participant ${nid} as ${label}`);
     });
     resolvedEdges.forEach((edge) => {
-      const guard = sanitizeMermaidLabel(edge.guardLabel || 'step');
+      const guard = sanitizeMermaidLabel(edge.guardLabel || 'step', 'step');
       lines.push(`    ${edge.from}->>${edge.to}: ${guard}`);
     });
   } else {
@@ -128,12 +133,12 @@ export function compileDeterministicMermaid(
     lines.push('flowchart TD');
     nodes.forEach((node, idx) => {
       const nid = idMap.get(node.id) || `N${idx + 1}`;
-      const label = sanitizeMermaidLabel(node.label);
+      const label = sanitizeMermaidLabel(node.label, `Step ${idx + 1} L${node.startLine}`);
       lines.push(`    ${nid}["${label}"]`);
     });
     resolvedEdges.forEach((edge) => {
-      if (edge.guardLabel && edge.guardLabel.trim().length > 0) {
-        const guard = sanitizeMermaidLabel(edge.guardLabel);
+      const guard = edge.guardLabel ? sanitizeMermaidLabel(edge.guardLabel, '') : '';
+      if (guard.length > 0) {
         lines.push(`    ${edge.from} -->|"${guard}"| ${edge.to}`);
       } else {
         lines.push(`    ${edge.from} --> ${edge.to}`);
@@ -811,13 +816,22 @@ function parseLLMJsonResponse(raw: string, context: HarvestedContext): Structure
     ? parsed.nodes
     : (Array.isArray(parsed.steps) ? parsed.steps : (Array.isArray(parsed.blocks) ? parsed.blocks : []));
 
-  let nodes: AnalysisNode[] = rawNodesList.map((n: any, idx: number) => ({
-    id: String(n.id || `N${idx + 1}`),
-    label: String(n.label || n.title || n.name || `Step ${idx + 1}`),
-    startLine: Number(n.startLine || n.line) || context.startLine,
-    endLine: Number(n.endLine || n.startLine || n.line) || context.endLine,
-    explanation: String(n.explanation || n.description || n.label || '')
-  }));
+  let nodes: AnalysisNode[] = rawNodesList
+    .map((n: any, idx: number) => {
+      const startL = Number(n?.startLine || n?.line) || context.startLine;
+      const endL = Number(n?.endLine || n?.startLine || n?.line) || context.endLine;
+      const rawLabel = String(n?.label || n?.title || n?.name || n?.explanation || '');
+      const cleanLabel = sanitizeMermaidLabel(rawLabel, '');
+      const cleanExplanation = sanitizeMermaidLabel(String(n?.explanation || n?.description || rawLabel || ''), '');
+      return {
+        id: String(n?.id || `N${idx + 1}`),
+        label: cleanLabel || cleanExplanation || '',
+        startLine: startL,
+        endLine: endL,
+        explanation: String(n?.explanation || n?.description || cleanLabel || `Lines ${startL}-${endL}`)
+      };
+    })
+    .filter((n: AnalysisNode) => n.label.length > 0);
 
   let edges: AnalysisEdge[] = (Array.isArray(parsed.edges) ? parsed.edges : []).map((e: any) => ({
     from: String(e.from || e.source || 'N1'),
