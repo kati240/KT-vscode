@@ -4,6 +4,8 @@
 
 CodeMist is a language-agnostic extension that instantly demystifies complex code. Select any block of code or function, and CodeMist synthesizes an interactive **Mermaid.js execution diagram**, maps out **upstream callers and downstream callees**, and runs **What-If edge-case scenario tracing** to expose potential runtime blind spots—all powered by local LLMs (Ollama/vLLM) or remote providers (OpenAI, Gemini).
 
+![CodeMist Interactive Demo](https://raw.githubusercontent.com/kati240/KT-vscode/main/resources/demo.gif)
+
 ---
 
 ## ✨ Features

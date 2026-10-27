@@ -4,6 +4,7 @@ node_modules/**
 tsconfig.json
 esbuild.js
 *.vsix
+resources/demo.gif
 .git/**
 .gitignore
 
